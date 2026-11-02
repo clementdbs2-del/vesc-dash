@@ -1,0 +1,290 @@
+name: Build APK
+
+# Il suffit d'avoir index.html + ce fichier dans le depot.
+# Lance-le depuis l'onglet Actions -> Build APK -> Run workflow.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Generer le projet
+        run: |
+          cat > package.json <<'EOF_FILE'
+          {
+            "name": "vesc-dash-apk",
+            "version": "1.0.0",
+            "private": true,
+            "type": "module",
+            "scripts": {
+              "prepare-www": "node scripts/prepare-www.mjs",
+              "patch-android": "node scripts/patch-android.mjs"
+            },
+            "dependencies": {
+              "@capacitor/android": "^7.0.0",
+              "@capacitor/core": "^7.0.0",
+              "@capacitor-community/bluetooth-le": "^7.0.0",
+              "leaflet": "1.9.4"
+            },
+            "devDependencies": {
+              "@capacitor/assets": "^3.0.5",
+              "@capacitor/cli": "^7.0.0",
+              "esbuild": "^0.25.0"
+            }
+          }
+          EOF_FILE
+          cat > capacitor.config.json <<'EOF_FILE'
+          {
+            "appId": "com.vescdash.app",
+            "appName": "VESC DASH",
+            "webDir": "www",
+            "backgroundColor": "#050505",
+            "android": { "allowMixedContent": false },
+            "plugins": {
+              "BluetoothLe": {
+                "displayStrings": {
+                  "scanning": "Recherche…",
+                  "cancel": "Annuler",
+                  "availableDevices": "Appareils disponibles",
+                  "noDeviceFound": "Aucun appareil trouvé"
+                }
+              }
+            }
+          }
+          EOF_FILE
+          mkdir -p src
+          cat > src/webbluetooth-shim.js <<'EOF_FILE'
+          // Implémente le sous-ensemble de Web Bluetooth utilisé par VESC DASH
+          // au-dessus de BleClient (@capacitor-community/bluetooth-le).
+          export function createWebBluetooth(BleClient) {
+            let inited = false;
+            const ensureInit = async () => {
+              if (!inited) { await BleClient.initialize(); inited = true; }
+            };
+            const toDV = v => v instanceof DataView ? v
+              : new DataView(v.buffer ?? v, v.byteOffset ?? 0, v.byteLength ?? v.length);
+
+            class Characteristic extends EventTarget {
+              constructor(deviceId, service, uuid) {
+                super();
+                this._d = deviceId; this._s = service; this.uuid = uuid; this.value = null;
+              }
+              async startNotifications() {
+                await BleClient.startNotifications(this._d, this._s, this.uuid, dv => {
+                  this.value = dv;
+                  this.dispatchEvent(new Event("characteristicvaluechanged"));
+                });
+                return this;
+              }
+              async stopNotifications() {
+                try { await BleClient.stopNotifications(this._d, this._s, this.uuid); } catch (_) {}
+                return this;
+              }
+              async writeValue(v) { await BleClient.write(this._d, this._s, this.uuid, toDV(v)); }
+              async writeValueWithoutResponse(v) { await BleClient.writeWithoutResponse(this._d, this._s, this.uuid, toDV(v)); }
+            }
+
+            class Service {
+              constructor(deviceId, uuid) { this._d = deviceId; this.uuid = uuid; }
+              async getCharacteristic(uuid) { return new Characteristic(this._d, this.uuid, uuid); }
+            }
+
+            class Device extends EventTarget {
+              constructor(info) {
+                super();
+                this.id = info.deviceId; this.name = info.name ?? null;
+                const dev = this;
+                this.gatt = {
+                  device: dev,
+                  connected: false,
+                  async connect() {
+                    await BleClient.connect(dev.id, () => dev._lost());
+                    this.connected = true;
+                    return {
+                      device: dev, connected: true,
+                      getPrimaryService: async uuid => new Service(dev.id, uuid),
+                    };
+                  },
+                  async disconnect() {
+                    try { await BleClient.disconnect(dev.id); } catch (_) {}
+                    dev._lost();
+                  },
+                };
+              }
+              _lost() {
+                if (!this.gatt.connected) return;
+                this.gatt.connected = false;
+                this.dispatchEvent(new Event("gattserverdisconnected"));
+              }
+            }
+
+            return {
+              async requestDevice(opts = {}) {
+                await ensureInit();
+                const services = [];
+                for (const f of opts.filters ?? []) for (const s of f.services ?? []) services.push(s);
+                const info = await BleClient.requestDevice(services.length ? { services } : {});
+                return new Device(info);
+              },
+              async getAvailability() { return true; },
+            };
+          }
+          EOF_FILE
+          mkdir -p src
+          cat > src/native-ble.js <<'EOF_FILE'
+          import { Capacitor } from "@capacitor/core";
+          import { BleClient } from "@capacitor-community/bluetooth-le";
+          import { createWebBluetooth } from "./webbluetooth-shim.js";
+
+          if (Capacitor.isNativePlatform()) {
+            Object.defineProperty(navigator, "bluetooth", {
+              value: createWebBluetooth(BleClient),
+              configurable: true,
+            });
+          }
+          EOF_FILE
+          mkdir -p scripts
+          cat > scripts/prepare-www.mjs <<'EOF_FILE'
+          import fs from "node:fs";
+          import path from "node:path";
+          import { execSync } from "node:child_process";
+
+          const root = path.resolve(import.meta.dirname, "..");
+          const www = path.join(root, "www");
+          fs.rmSync(www, { recursive: true, force: true });
+          fs.mkdirSync(path.join(www, "lib/leaflet"), { recursive: true });
+
+          // Leaflet en local (fonctionne sans réseau)
+          const dist = path.join(root, "node_modules/leaflet/dist");
+          fs.copyFileSync(path.join(dist, "leaflet.js"), path.join(www, "lib/leaflet/leaflet.js"));
+          fs.copyFileSync(path.join(dist, "leaflet.css"), path.join(www, "lib/leaflet/leaflet.css"));
+          fs.cpSync(path.join(dist, "images"), path.join(www, "lib/leaflet/images"), { recursive: true });
+
+          // Pont Web Bluetooth -> BLE natif
+          execSync(`npx esbuild src/native-ble.js --bundle --format=iife --minify --outfile=www/native-ble.js`,
+            { cwd: root, stdio: "inherit" });
+
+          let html = fs.readFileSync(path.join(root, "index.html"), "utf8");
+          const must = (cond, msg) => { if (!cond) throw new Error("prepare-www: " + msg); };
+
+          const CSS = '<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">';
+          const JS = '<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>';
+          must(html.includes(CSS) && html.includes(JS), "balises Leaflet introuvables");
+          html = html.replace(CSS, '<link rel="stylesheet" href="lib/leaflet/leaflet.css">');
+          html = html.replace(JS, '<script src="native-ble.js"></script>\n<script src="lib/leaflet/leaflet.js"></script>');
+
+          // Pas de service worker ni de manifest dans l'APK (le cache serait périmé après une mise à jour)
+          const before = html.length;
+          html = html.replace(/if\("serviceWorker" in navigator[\s\S]*?\n\}\n/, "");
+          must(html.length < before, "bloc service worker introuvable");
+          html = html.replace(/<link rel="manifest"[^>]*>\n?/, "");
+
+          fs.writeFileSync(path.join(www, "index.html"), html);
+          console.log("www/ prêt");
+          EOF_FILE
+          mkdir -p scripts
+          cat > scripts/patch-android.mjs <<'EOF_FILE'
+          import fs from "node:fs";
+          import path from "node:path";
+
+          const app = path.resolve(import.meta.dirname, "../android/app/src/main");
+
+          // 1) Permissions
+          const mf = path.join(app, "AndroidManifest.xml");
+          let xml = fs.readFileSync(mf, "utf8");
+          const perms = [
+            '<uses-permission android:name="android.permission.INTERNET" />',
+            '<uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />',
+            '<uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />',
+            '<uses-permission android:name="android.permission.BLUETOOTH_SCAN" />',
+            '<uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />',
+            '<uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />',
+            '<uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />',
+            '<uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />',
+          ];
+          const add = perms.filter(p => !xml.includes(p.match(/android:name="([^"]+)"/)[1])).join("\n    ");
+          if (add) xml = xml.replace("<application", add + "\n\n    <application");
+          fs.writeFileSync(mf, xml);
+
+          // 2) Écran toujours allumé (remplace le Wake Lock du navigateur)
+          const dir = path.join(app, "java/com/vescdash/app");
+          fs.mkdirSync(dir, { recursive: true });
+          fs.writeFileSync(path.join(dir, "MainActivity.java"), `package com.vescdash.app;
+
+          import android.os.Bundle;
+          import android.view.WindowManager;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+              }
+          }
+          `);
+          console.log("Android patché");
+          EOF_FILE
+          mkdir -p scripts
+          cat > scripts/make-icons.py <<'EOF_FILE'
+          from PIL import Image, ImageDraw
+          import math, os
+          os.makedirs("assets", exist_ok=True)
+          S=1024
+          def gauge(r_frac):
+              T=S*2; im=Image.new("RGBA",(T,T),(0,0,0,0)); d=ImageDraw.Draw(im)
+              c=T/2; r=T*r_frac; w=int(r*0.15); box=[c-r,c-r,c+r,c+r]
+              d.arc(box,135,405,fill=(38,38,38,255),width=w)
+              d.arc(box,135,330,fill=(47,123,255,255),width=w)
+              a=math.radians(330); rr=r*0.78
+              d.line([c,c,c+rr*math.cos(a),c+rr*math.sin(a)],fill=(242,239,233,255),width=int(r*0.06))
+              h=r*0.1; d.ellipse([c-h,c-h,c+h,c+h],fill=(47,123,255,255))
+              return im.resize((S,S),Image.LANCZOS)
+          bg=Image.new("RGBA",(S,S),(5,5,5,255)); bg.save("assets/icon-background.png")
+          gauge(0.30).save("assets/icon-foreground.png")
+          full=bg.copy(); full.alpha_composite(gauge(0.40)); full.save("assets/icon-only.png")
+          EOF_FILE
+
+      - name: Installer les dependances
+        run: npm install
+
+      - name: Preparer www
+        run: npm run prepare-www
+
+      - name: Creer le projet Android
+        run: npx cap add android
+
+      - name: Permissions + ecran allume
+        run: npm run patch-android
+
+      - name: Icones
+        continue-on-error: true
+        run: |
+          pip install pillow
+          python3 scripts/make-icons.py
+          npx capacitor-assets generate --android --iconBackgroundColor '#050505' --iconBackgroundColorDark '#050505'
+
+      - name: Synchroniser
+        run: npx cap sync android
+
+      - name: Compiler l'APK
+        working-directory: android
+        run: ./gradlew assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vesc-dash-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
